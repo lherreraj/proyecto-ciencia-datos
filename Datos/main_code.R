@@ -1,201 +1,322 @@
-# ======================================================================
-# 03_data_import_clean.R
-# Importación, depuración y unión de:
-# - non_net_users_num.csv
-# - gini.csv
-# Salidas:
-# - data/processed/non_net_users_clean.csv
-# - data/processed/gini_clean.csv
-# - data/processed/combined_panel.csv
-# - outputs/data_dictionary.csv
-# ======================================================================
+# ============================
+# 1) Paquetes
+# ============================
 
-# 0) Paquetes -----------------------------------------------------------
-required_pkgs <- c(
-  "readr","dplyr","tidyr","stringr","janitor","lubridate","fs","here"
-)
-
-to_install <- setdiff(required_pkgs, rownames(installed.packages()))
+pkgs <- c("dplyr","tidyr","stringr","readr","janitor",
+          "countrycode","plm","lmtest","sandwich","broom",
+          "leaflet","classInt","rnaturalearth","rnaturalearthdata","sf")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
 if (length(to_install) > 0) install.packages(to_install, quiet = TRUE)
 
-library(readr)
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(janitor)
-library(lubridate)
-library(fs)
+
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
 library(here)
 
-# 1) Estructura de carpetas --------------------------------------------
-dir_create(here("data"))
-dir_create(here("data","raw"))
-dir_create(here("data","processed"))
-dir_create(here("scripts"))
-dir_create(here("outputs"))
+invisible(lapply(pkgs, library, character.only = TRUE))
 
-# 2) Rutas de entrada ---------------------------------------------------
-# Si trabajas local con los adjuntos, mueve los CSV a data/raw y usa:
-path_nonnet <- here("data","raw","non_net_users_num.csv")
-path_gini   <- here("data","raw","gini.csv")
 
-# Si prefieres que el script descargue desde GitHub cuando ya estén subidos:
-# url_nonnet <- "https://raw.githubusercontent.com/<user>/<repo>/main/data/raw/non_net_users_num.csv"
-# url_gini   <- "https://raw.githubusercontent.com/<user>/<repo>/main/data/raw/gini.csv"
-# download.file(url_nonnet, destfile = path_nonnet, mode = "wb")
-# download.file(url_gini,   destfile = path_gini,   mode = "wb")
+#Rutas de entrada ---------------------------------------------------
+path_nonnet <- here("Datos", "non_net_users_num.csv")
+path_gini   <- here("Datos", "gini.csv")
+path_pop  <- here("Datos", "pop.csv")
 
-stopifnot(file_exists(path_nonnet), file_exists(path_gini))
+# URLs en crudo (raw) de GitHub para descargar automáticamente los CSV al proyecto.
+url_nonnet <- "https://raw.githubusercontent.com/lherreraj/proyecto-ciencia-datos/main/Datos/non_net_users_num.csv"
+url_gini   <- "https://raw.githubusercontent.com/lherreraj/proyecto-ciencia-datos/main/Datos/gini.csv"
+url_pop   <- "https://raw.githubusercontent.com/lherreraj/proyecto-ciencia-datos/main/Datos/pop.csv"
 
-# 3) Funciones auxiliares -----------------------------------------------
-clean_keys <- function(df, country_col = "country", year_col = "year") {
-  df |>
-    rename(country = all_of(country_col), year = all_of(year_col)) |>
-    mutate(
-      country = country |> as.character() |> str_squish() |> str_to_title(),
-      year    = suppressWarnings(as.integer(year))
+
+# Descarga los ficheros a las rutas definidas. El modo "wb" asegura escritura binaria correcta.
+if (!file.exists(path_nonnet)) {
+  download.file(url_nonnet, destfile = path_nonnet, mode = "wb", quiet = TRUE)
+}
+if (!file.exists(path_gini)) {
+  download.file(url_gini,   destfile = path_gini,   mode = "wb", quiet = TRUE)
+}
+if (!file.exists(path_pop)) {
+  download.file(url_pop,    destfile = path_pop,    mode = "wb", quiet = TRUE)
+}
+
+# Validación temprana: detiene la ejecución si falta algún archivo.
+stopifnot(file.exists(path_nonnet), file.exists(path_gini), file.exists(path_pop))
+
+#Funciones auxiliares
+#---------------------------
+#Describir DF
+# describe_df: genera un diccionario rápido de un data.frame con:
+# - nombre de variable
+# - clase (tipo de dato)
+# - número de valores faltantes
+# - número de valores únicos
+describe_df <- function(df) {
+    tibble::tibble(
+      variable   = names(df),
+      class      = vapply(df, function(x) paste(class(x), collapse = ","), character(1)),
+      n_missing  = vapply(df, function(x) sum(is.na(x)), integer(1)),
+      n_unique   = vapply(df, function(x) dplyr::n_distinct(x), integer(1))
     )
 }
 
-validate_year <- function(df, min_year = 1900, max_year = year(Sys.Date()) + 1) {
-  df |> filter(!is.na(year), year >= min_year, year <= max_year)
+
+# Función para convertir "100k", "1.2M", "850" a numérico
+# parse_abbrev_num: estandariza cifras abreviadas con sufijos k, m, b a escala numérica
+# - convierte a minúsculas
+# - trata valores nulos comunes
+# - detecta sufijo y aplica multiplicador
+# Nota: se asume que los años se quedan en ancho. Esta función se aplicará
+# a columnas de años en nonnet y población antes de pivotar.
+parse_abbrev_num <- function(x) {
+  y <- tolower(str_squish(as.character(x)))
+  y[y %in% c("", "na", "nan", "null", ".", "..")] <- NA
+  
+  out <- rep(NA_real_, length(y))
+  
+  # Detecta si termina en k, m o b
+  has_suf <- !is.na(y) & str_detect(y, "[kmb]$")
+  
+  if (any(has_suf, na.rm = TRUE)) {
+    yy <- y[has_suf]
+    # Extraer número y sufijo con regex robusto
+    m <- str_match(yy, "^([0-9]+(?:[\\.,][0-9]+)?)\\s*([kmb])$")
+    base <- suppressWarnings(as.numeric(str_replace(m[,2], ",", ".")))
+    mult <- case_when(
+      m[,3] == "k" ~ 1e3,
+      m[,3] == "m" ~ 1e6,
+      m[,3] == "b" ~ 1e9,
+      TRUE ~ 1
+    )
+    out[has_suf] <- base * mult
+  }
+  
+  return(out)
 }
 
-dedupe_by_key <- function(df, key = c("country","year")) {
-  df |>
-    group_by(across(all_of(key))) |>
-    summarise(across(everything(), ~ {
-      # Si hay duplicados, por defecto nos quedamos con el último no NA
-      x <- .
-      x[rev(seq_along(x))[which(!is.na(rev(x)))[1]]] %||% NA
-    }), .groups = "drop")
-}
 
-describe_df <- function(df) {
-  tibble(
-    variable = names(df),
-    class = vapply(df, \(x) paste(class(x), collapse = ","), character(1)),
-    n_missing = vapply(df, \(x) sum(is.na(x)), integer(1))
-  )
-}
 
-`%||%` <- function(a, b) if (!is.null(a)) a else b
-
-# 4) Importación --------------------------------------------------------
-nonnet_raw <- read_csv(
+# Importación --------------------------------------------------------
+# Carga los tres datasets desde las rutas locales definidas.
+# Se mantiene la estructura original de nombres de columnas sin clean_names().
+nonnet_data <- read_csv(
   file = path_nonnet,
   show_col_types = FALSE,
   na = c("", "NA", "NaN", "NULL", ".", "..")
-) |> clean_names()
+) #|> clean_names()
 
-gini_raw <- read_csv(
+gini_data <- read_csv(
   file = path_gini,
   show_col_types = FALSE,
   na = c("", "NA", "NaN", "NULL", ".", "..")
-) |> clean_names()
+) #|> clean_names()
 
-# 5) Inspección rápida (opcional de consola) ---------------------------
-# glimpse(nonnet_raw); glimpse(gini_raw)
+pop_data <- read_csv(
+  file = path_pop,
+  show_col_types = FALSE,
+  na = c("", "NA", "NaN", "NULL", ".", "..")
+) #|> clean_names()
 
-# 6) Normalización de claves y tipos -----------------------------------
-# Intentamos adivinar columnas de país y año comunes
-# Si tus CSV ya se llaman country/year perfecto; si no, ajusta los nombres aquí.
-guess_country_col <- function(df) {
-  cand <- intersect(names(df), c("country","pais","location","entity","name"))
-  if (length(cand) == 0) stop("No encuentro columna de país. Renombra en el CSV o ajusta la función.")
-  cand[1]
-}
-guess_year_col <- function(df) {
-  cand <- intersect(names(df), c("year","anio","ano","date","date_year","time","yr"))
-  if (length(cand) == 0) stop("No encuentro columna de año. Renombra en el CSV o ajusta la función.")
-  cand[1]
-}
+# Resumen de nonnet_data
+# Diagnóstico descriptivo de columnas, clases y faltantes.
+describe_df(nonnet_data)
 
-nonnet <- nonnet_raw |>
-  clean_keys(country_col = guess_country_col(nonnet_raw),
-             year_col    = guess_year_col(nonnet_raw)) |>
-  validate_year() |>
-  mutate(across(where(is.double), ~ ifelse(is.infinite(.x), NA, .x)))
+# Resumen de gini_data
+describe_df(gini_data)
 
-gini <- gini_raw |>
-  clean_keys(country_col = guess_country_col(gini_raw),
-             year_col    = guess_year_col(gini_raw)) |>
-  validate_year() |>
-  mutate(across(where(is.double), ~ ifelse(is.infinite(.x), NA, .x)))
+# Resumen de gini_data
+describe_df(pop_data)
 
-# 7) Renombrado mínimo y coerción de métricas --------------------------
-# Intenta detectar la variable principal en cada dataset si no tiene nombre obvio
-# Ajusta si sabes el nombre exacto.
-detect_value_col <- function(df, prefer = c("non_net_users","non_internet_users","non_users","value","gini","gini_index","gini_coefficient")) {
-  v <- intersect(names(df), prefer)
-  if (length(v) > 0) return(v[1])
-  # si no, toma la primera numérica que no sea year
-  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
-  setdiff(num_cols, "year")[1] %||% stop("No se pudo detectar columna de valor.")
-}
 
-nonnet_value_col <- detect_value_col(nonnet, prefer = c("non_net_users","non_internet_users","non_users","value"))
-gini_value_col   <- detect_value_col(gini,   prefer = c("gini","gini_index","gini_coefficient","value"))
+# 1) Columnas de años: todo menos "country"
+# Se asume forma ancha, con una columna "country" y el resto años.
+year_cols_nonnet <- setdiff(names(nonnet_data), "country")
+year_cols_gini   <- setdiff(names(gini_data),   "country")
+year_cols_pop   <- setdiff(names(pop_data),   "country")
 
-nonnet_clean <- nonnet |>
-  select(country, year, !!sym(nonnet_value_col)) |>
-  rename(non_net_users_num = !!sym(nonnet_value_col)) |>
-  mutate(non_net_users_num = suppressWarnings(as.numeric(non_net_users_num))) |>
-  dedupe_by_key()
+#    Convierte "100k", "1.2M", etc. a numérico
+# Aplica el parser a nonnet y población para homogeneizar a valores numéricos.
+nonnet_data[year_cols_nonnet] <- lapply(nonnet_data[year_cols_nonnet], parse_abbrev_num)
+pop_data[year_cols_pop] <- lapply(pop_data[year_cols_pop], parse_abbrev_num)
 
-gini_clean <- gini |>
-  select(country, year, !!sym(gini_value_col)) |>
-  rename(gini = !!sym(gini_value_col)) |>
-  mutate(gini = suppressWarnings(as.numeric(gini))) |>
-  dedupe_by_key()
+# Intersección de años presentes en los tres datasets para garantizar alineación.
+years_common <- Reduce(intersect, list(year_cols_nonnet, year_cols_gini, year_cols_pop))
 
-# 8) Validaciones cruzadas ---------------------------------------------
-# Países que no hacen match entre ambas tablas
-left_only <- anti_join(nonnet_clean, gini_clean, by = c("country","year")) |>
-  count(country, sort = TRUE)
-right_only <- anti_join(gini_clean, nonnet_clean, by = c("country","year")) |>
-  count(country, sort = TRUE)
+# Subconjuntos alineados en forma ancha, preservando "country".
+nonnet_aligned <- nonnet_data[, c("country", years_common)]
+gini_aligned   <- gini_data[,   c("country", years_common)]
+pop_aligned   <- pop_data[,   c("country", years_common)]
 
-# Puedes guardar estos reportes para revisar
-write_csv(left_only,  here("outputs","_nonnet_without_gini.csv"))
-write_csv(right_only, here("outputs","_gini_without_nonnet.csv"))
 
-# 9) Unión y features básicos ------------------------------------------
-combined <- nonnet_clean |>
-  inner_join(gini_clean, by = c("country","year")) |>
-  arrange(country, year)
+# ============================
+# 3) Pasar a formato largo y unir
+# ============================
+# Se pivotan los tres dataframes a largo con columnas: country, year, valor.
+# Esto simplifica la unión y el análisis temporal.
+nn_long <- nonnet_aligned |>
+  pivot_longer(-country, names_to = "year", values_to = "nonnet") |>
+  mutate(year = as.integer(year))
 
-# Ejemplos de features simples. Ajusta a tu caso real:
-# - growth de non_net_users (variación anual)
-combined <- combined |>
-  group_by(country) |>
-  arrange(year, .by_group = TRUE) |>
+gini_long <- gini_aligned |>
+  pivot_longer(-country, names_to = "year", values_to = "gini") |>
+  mutate(year = as.integer(year),
+         gini = suppressWarnings(as.numeric(gini)))
+
+pop_long <- pop_aligned |>
+  pivot_longer(-country, names_to = "year", values_to = "pop") |>
+  mutate(year = as.integer(year))
+
+# Unión en panel: cada fila es un país-año con nonnet, gini y población.
+panel <- nn_long |>
+  inner_join(gini_long, by = c("country","year")) |>
+  inner_join(pop_long,  by = c("country","year"))
+
+# ============================
+# 4) Normalización y ratio
+# ============================
+# Se normaliza el no uso de internet por población del país y año.
+# Se crea el indicador ratio = gini / nonnet_norm para explorar la relación relativa.
+panel <- panel |>
   mutate(
-    non_net_users_yoy = non_net_users_num - lag(non_net_users_num),
-    gini_yoy          = gini - lag(gini),
-    period            = case_when(
-      year < 2000 ~ "pre_2000",
-      year >= 2000 & year < 2010 ~ "2000s",
-      year >= 2010 & year < 2020 ~ "2010s",
-      year >= 2020 ~ "2020s",
-      TRUE ~ "unknown"
-    )
+    # proporción de no usuarios sobre la población (0 a 1). 
+    nonnet_norm = ifelse(pop > 0, nonnet / pop, NA_real_),
+    ratio = ifelse(!is.na(nonnet_norm) & nonnet_norm > 0, gini / nonnet_norm, NA_real_)
+  )
+
+# Limpieza básica
+# - eliminación de observaciones con NA o infinitos
+panel <- panel |>
+  filter(!is.na(gini), !is.na(nonnet_norm), is.finite(nonnet_norm), is.finite(gini)) |>
+  mutate(
+    country_std = str_to_title(trimws(country)),
+    iso3c = countrycode(country_std, "country.name", "iso3c", warn = FALSE)
+  ) |>
+  filter(!is.na(iso3c))
+
+# ============================
+# 5) Correlaciones
+# ============================
+# Cálculo de correlaciones globales entre gini y nonnet_norm:
+# - Pearson para relación lineal
+# - Spearman para relación monótona
+cor_global_p  <- cor(panel$gini, panel$nonnet_norm, use = "pairwise", method = "pearson")
+cor_global_s  <- cor(panel$gini, panel$nonnet_norm, use = "pairwise", method = "spearman")
+
+# Separamos la variación BETWEEN (entre países) y WITHIN (intra-país a lo largo del tiempo)
+panel <- panel |>
+  group_by(country_std) |>
+  mutate(
+    gini_c     = gini - mean(gini, na.rm = TRUE),
+    nonnet_c   = nonnet_norm - mean(nonnet_norm, na.rm = TRUE)
+  ) |>
+  ungroup() |>
+  group_by(year) |>
+  mutate(
+    gini_t     = gini - mean(gini, na.rm = TRUE),
+    nonnet_t   = nonnet_norm - mean(nonnet_norm, na.rm = TRUE)
   ) |>
   ungroup()
 
-# 10) Diccionario de datos rápido ---------------------------------------
-dict_nonnet <- describe_df(nonnet_clean) |> mutate(dataset = "non_net_users_clean")
-dict_gini   <- describe_df(gini_clean)   |> mutate(dataset = "gini_clean")
-dict_comb   <- describe_df(combined)     |> mutate(dataset = "combined_panel")
+# Correlación entre países: compara promedios por país
+cor_between <- cor(
+  panel |> distinct(country_std, gini_country = gini - mean(gini), nonnet_country = nonnet_norm - mean(nonnet_norm))
+  |> pull(gini_country),
+  panel |> distinct(country_std, gini_country = gini - mean(gini), nonnet_country = nonnet_norm - mean(nonnet_norm))
+  |> pull(nonnet_country),
+  use = "pairwise"
+)
 
-data_dictionary <- bind_rows(dict_nonnet, dict_gini, dict_comb)
-write_csv(data_dictionary, here("outputs","data_dictionary.csv"))
+# Correlación within: tras demeaning a nivel país
+cor_within <- cor(panel$gini_c, panel$nonnet_c, use = "pairwise")
 
-# 11) Guardar salidas procesadas ---------------------------------------
-write_csv(nonnet_clean, here("data","processed","non_net_users_clean.csv"))
-write_csv(gini_clean,   here("data","processed","gini_clean.csv"))
-write_csv(combined,     here("data","processed","combined_panel.csv"))
+# Reporte breve de resultados en consola
+cat("Correlación global Pearson gini vs nonnet_norm:", round(cor_global_p,3), "\n")
+cat("Correlación global Spearman gini vs nonnet_norm:", round(cor_global_s,3), "\n")
+cat("Correlación BETWEEN países:", round(cor_between,3), "\n")
+cat("Correlación WITHIN país:", round(cor_within,3), "\n")
 
-# 12) Mensajes finales --------------------------------------------------
-cat("\nListo. Archivos procesados en data/processed/ y reportes en outputs/.\n")
-cat("Registros combinados:", nrow(combined), " | Países:", n_distinct(combined$country), "\n")
+
+# ============================
+# 7) Mapa interactivo por año del ratio
+# ============================
+# Obtener shapes de países
+# Descarga geometrías a nivel país 
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+world <- world |>
+  mutate(iso3c = ifelse(!is.na(iso_a3_eh), iso_a3_eh, iso_a3)) |>
+  select(iso3c, name, geometry)
+
+# Datos del ratio por año
+# Agrega el ratio por país-año (media por si hubiera duplicados) y filtra valores finitos.
+ratio_year <- panel |>
+  select(iso3c, country_std, year, ratio) |>
+  group_by(iso3c, country_std, year) |>
+  summarise(ratio = mean(ratio, na.rm = TRUE), .groups = "drop") |>
+  filter(is.finite(ratio))
+
+# Rango común para la paleta
+# Construye paleta de colores basada en cuantiles para una distribución estable.
+ratio_all <- ratio_year$ratio
+pal <- colorBin("YlOrRd", domain = ratio_all, bins = classInt::classIntervals(ratio_all, n = 7, style = "quantile")$brks, na.color = "#cccccc")
+
+
+# Utilidad para resolver qué columna usar según 'var'
+.resolve_var <- function(var) {
+  var <- tolower(var)
+  if (var %in% c("gini")) return(list(col = "gini", title = "Coeficiente Gini"))
+  if (var %in% c("nonnet", "nonnet_norm", "nonnet_normalizado")) {
+    return(list(col = "nonnet_norm", title = "No uso de internet normalizado"))
+  }
+  if (var %in% c("ratio", "gini_nonnet_ratio", "gini_over_nonnet")) {
+    return(list(col = "ratio", title = "Ratio: gini / nonnet_norm"))
+  }
+  stop("Variable no soportada. Usa 'gini', 'ratio' o 'nonnet'.")
+}
+
+# Paleta basada en cuantiles para estabilidad visual
+.make_palette <- function(vec) {
+  vec <- vec[is.finite(vec)]
+  brks <- classInt::classIntervals(vec, n = 7, style = "quantile")$brks
+  colorBin("YlOrRd", domain = vec, bins = brks, na.color = "#cccccc")
+}
+
+# Mapa por año y variable
+# map_var_year: genera un mapa coroplético interactivo por año y variable elegida:
+# - une datos del panel a la geometría por ISO3
+# - arma paleta por cuantiles y leyenda
+# - etiqueta emergente con país, año y valor formateado
+map_var_year <- function(panel, world, sel_year, var = c("gini","ratio","nonnet")) {
+  vinfo <- .resolve_var(var[1])
+  vcol  <- vinfo$col
+  vttl  <- vinfo$title
+  
+  df <- panel |>
+    filter(year == sel_year) |>
+    select(iso3c, country_std, year, !!sym(vcol)) |>
+    rename(val = !!sym(vcol)) |>
+    distinct()
+  
+  shp <- world |>
+    left_join(df, by = "iso3c")
+  
+  pal <- .make_palette(df$val)
+  
+  leaflet(shp, options = leafletOptions(worldCopyJump = TRUE)) |>
+    addTiles() |>
+    addPolygons(
+      stroke = TRUE, weight = 0.5, color = "#555555",
+      fillColor = ~pal(val), fillOpacity = 0.85,
+      label = ~sprintf("<b>%s</b><br>Año: %s<br>%s: %s",
+                       ifelse(is.na(country_std), name, country_std),
+                       sel_year, vttl,
+                       ifelse(is.finite(val), format(round(val, 4), big.mark = ","), "NA")) |>
+        lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(weight = 2, color = "#000", bringToFront = TRUE)
+    ) |>
+    addLegend(position = "bottomright", pal = pal, values = df$val,
+              title = vttl, opacity = 0.85)
+}
+
+#Ejemplo de uso
+map_var_year(panel, world, 1990, var = c("nonnet"))#c("gini","ratio","nonnet")
+
+map_var_year(panel, world, 1990, var = c("gini"))#c("gini","ratio","nonnet")
+
+map_var_year(panel, world, 1990, var = c("ratio"))#c("gini","ratio","nonnet")

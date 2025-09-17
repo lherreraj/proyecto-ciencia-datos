@@ -1,0 +1,129 @@
+---
+title: "Desigualdad y Acceso a Internet (1990–2019)"
+author: "Lizeth Herrera Jerez"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    df_print: paged
+  beamer_presentation: default
+---
+
+
+```{r include=FALSE}
+#install.packages("here")
+library(here)
+```
+
+## Objetivo del Proyecto
+
+El objetivo principal de este proyecto es analizar la relación entre la desigualdad económica, medida a través del coeficiente de Gini, y el acceso a Internet, medido como el porcentaje de no usuarios normalizados por población.  
+
+### Objetivos específicos
+- Integrar bases de datos internacionales de desigualdad, uso de Internet y población en un panel anual por país (1990–2019).  
+- Normalizar las cifras de no usuarios de Internet para hacer comparaciones robustas entre países.  
+- Calcular un ratio entre Gini y no uso de Internet, como indicador combinado de desigualdad y brecha digital.  
+- Explorar correlaciones globales, entre países y dentro de países a lo largo del tiempo.  
+- Visualizar la evolución espacial y temporal del fenómeno mediante mapas interactivos y gráficos.  
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Paquetes mínimos para la presentación
+pkgs <- c("dplyr","tidyr","stringr","ggplot2","readr","knitr","kableExtra")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+#if (length(to_install) > 0) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Cargar el panel preparado por tu script definitivo
+source("../Datos/main_code.R", local = FALSE)
+
+# Comprobaciones mínimas
+stopifnot(exists("panel"))
+stopifnot(all(c("country_std","year","gini","nonnet_norm","ratio") %in% names(panel)))
+
+# Ventana temporal de análisis
+panel_use <- panel |> dplyr::filter(year >= 1990, year <= 2019)
+
+# Indicadores y correlaciones para insertar en texto
+n_countries <- dplyr::n_distinct(panel_use$country_std)
+n_years <- length(unique(panel_use$year))
+rng_years <- range(panel_use$year)
+
+cor_global_p  <- cor(panel_use$gini, panel_use$nonnet_norm, use = "pairwise.complete.obs", method = "pearson")
+cor_global_s  <- cor(panel_use$gini, panel_use$nonnet_norm, use = "pairwise.complete.obs", method = "spearman")
+
+country_means <- panel_use |>
+  dplyr::group_by(country_std) |>
+  dplyr::summarise(gini_mean = mean(gini, na.rm = TRUE),
+                   nonnet_mean = mean(nonnet_norm, na.rm = TRUE), .groups = "drop")
+cor_between <- cor(country_means$gini_mean, country_means$nonnet_mean, use = "pairwise.complete.obs")
+
+panel_within <- panel_use |>
+  dplyr::group_by(country_std) |>
+  dplyr::mutate(gini_c = gini - mean(gini, na.rm = TRUE),
+                nonnet_c = nonnet_norm - mean(nonnet_norm, na.rm = TRUE)) |>
+  dplyr::ungroup()
+cor_within <- cor(panel_within$gini_c, panel_within$nonnet_c, use = "pairwise.complete.obs")
+
+```
+
+## Tabla de Indicadores
+
+La tabla muestra un resumen de los principales indicadores del panel utilizado, incluyendo el número de países y años cubiertos, así como los coeficientes de correlación entre desigualdad y no uso de Internet.  
+```{r}
+
+resumen <- tibble::tibble(
+  Indicador = c(
+    "Países",
+    "Años (min–max)",
+    "Correlación global (Pearson)",
+    "Correlación global (Spearman)",
+    "Correlación entre países (between)",
+    "Correlación dentro de países (within)"
+  ),
+  Valor = c(
+    n_countries,
+    sprintf("%s–%s", rng_years[1], rng_years[2]),
+    sprintf("%.3f", cor_global_p),
+    sprintf("%.3f", cor_global_s),
+    sprintf("%.3f", cor_between),
+    sprintf("%.3f", cor_within)
+  )
+)
+
+knitr::kable(resumen, align = c("l","r")) |>
+  kableExtra::kable_styling(full_width = FALSE)
+
+```
+
+
+## Relación Global
+
+El gráfico muestra la relación entre el coeficiente de Gini y el no uso de Internet normalizado, con un ajuste lineal para todos los países y años del panel.
+```{r}
+panel_plot <- panel_use |>
+  dplyr::mutate(decade = paste0(floor(year/10)*10, "s"))
+
+ggplot(panel_plot, aes(x = gini, y = nonnet_norm)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.9) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Desigualdad (Gini) vs no uso de Internet (normalizado)",
+    x = "Coeficiente de Gini",
+    y = "No uso de Internet / Población",
+    caption = "Puntos país-año; línea: ajuste lineal global."
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+```{r}
+# Compilar
+#rmarkdown::render("presentacion.Rmd")
+#sessionInfo()
+
+```

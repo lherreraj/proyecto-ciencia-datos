@@ -1,0 +1,200 @@
+---
+title: "Desigualdad y Acceso a Internet (1990–2019)"
+author: "Lizeth Herrera Jerez"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+  pdf_document: default
+fontsize: 11pt
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Introducción
+
+El presente informe analiza la relación entre la **desigualdad económica** (medida a través del coeficiente de Gini) y el **acceso a Internet** (aproximado por el porcentaje de población que no utiliza Internet, normalizado por la población total) en el periodo 1990–2019.  
+
+Este análisis busca ofrecer una visión cuantitativa sobre cómo la brecha digital se vincula con patrones estructurales de desigualdad entre países y a lo largo del tiempo.
+
+---
+
+# Objetivos
+
+**Objetivo principal**  
+Explorar y cuantificar la relación entre desigualdad económica y acceso a Internet en un panel de países a lo largo del tiempo (1990–2019).  
+
+**Objetivos específicos**
+- Integrar datos de desigualdad (Gini), población y no uso de Internet en un panel anual por país.  
+- Normalizar el número de no usuarios de Internet respecto a la población total.  
+- Calcular correlaciones globales, *between* y *within* para entender dinámicas estructurales y temporales.  
+- Visualizar gráficamente tendencias globales y relaciones clave entre variables.  
+
+---
+
+# Metodología
+
+- **Datos**:  
+  - Coeficiente de Gini histórico por país.  
+  - Número de usuarios que no utilizan Internet (valores normalizados por población).  
+  - Datos de población nacional anual.  
+
+- **Transformaciones**:  
+  - Limpieza de datos y homogenización de unidades (conversión de abreviaturas “k”, “M”).  
+  - Normalización del no uso de Internet sobre población total.  
+  - Creación de un ratio combinado (*Gini / no uso normalizado*).  
+
+- **Análisis**:  
+  - Cálculo de correlaciones globales, entre países (*between*) y dentro de países (*within*).  
+  - Visualización mediante tablas resumen, gráficos de dispersión y tendencias temporales agregadas.  
+
+---
+
+# Resultados
+
+## Indicadores Generales
+
+La siguiente tabla resume los indicadores clave del panel de datos y las correlaciones calculadas entre desigualdad y no uso de Internet.
+
+
+```{r }
+# Paquetes mínimos
+pkgs <- c("dplyr","tidyr","stringr","ggplot2","readr","knitr","kableExtra", "here")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Cargar el panel preparado por tu script definitivo
+source("../Datos/main_code.R", local = FALSE)
+
+# Verificaciones básicas
+stopifnot(exists("panel"), exists("world"))
+stopifnot(all(c("country_std","iso3c","year","gini","nonnet_norm","ratio") %in% names(panel)))
+
+# Ventana temporal de análisis
+panel_use <- panel |> dplyr::filter(year >= 1990, year <= 2019)
+
+```
+
+```{r}
+# Indicadores agregados
+years <- range(panel_use$year, na.rm = TRUE)
+n_countries <- dplyr::n_distinct(panel_use$country_std)
+
+# Correlaciones
+cor_global_p  <- cor(panel_use$gini, panel_use$nonnet_norm, use = "pairwise.complete.obs", method = "pearson")
+cor_global_s  <- cor(panel_use$gini, panel_use$nonnet_norm, use = "pairwise.complete.obs", method = "spearman")
+
+country_means <- panel_use |>
+  group_by(country_std) |>
+  summarise(gini_mean = mean(gini, na.rm = TRUE),
+            nonnet_mean = mean(nonnet_norm, na.rm = TRUE), .groups = "drop")
+cor_between <- cor(country_means$gini_mean, country_means$nonnet_mean, use = "pairwise.complete.obs")
+
+panel_within <- panel_use |>
+  group_by(country_std) |>
+  mutate(gini_c = gini - mean(gini, na.rm = TRUE),
+         nonnet_c = nonnet_norm - mean(nonnet_norm, na.rm = TRUE)) |>
+  ungroup()
+cor_within <- cor(panel_within$gini_c, panel_within$nonnet_c, use = "pairwise.complete.obs")
+
+resumen <- tibble::tibble(
+  Indicador = c(
+    "Países", "Años (min–max)",
+    "Correlación global (Pearson)",
+    "Correlación global (Spearman)",
+    "Correlación entre países (between)",
+    "Correlación dentro de países (within)"
+  ),
+  Valor = c(
+    n_countries,
+    sprintf("%s–%s", years[1], years[2]),
+    sprintf("%.3f", cor_global_p),
+    sprintf("%.3f", cor_global_s),
+    sprintf("%.3f", cor_between),
+    sprintf("%.3f", cor_within)
+  )
+)
+
+knitr::kable(resumen, align = c("l","r"), caption = "Indicadores generales y correlaciones Gini vs no-uso de Internet normalizado") |>
+  kableExtra::kable_styling(full_width = FALSE)
+
+```
+## Interpretación de la Tabla
+
+- Se incluyeron **`r n_countries` países** en el periodo **`r years[1]`–`r years[2]`**.  
+- Las correlaciones globales muestran una relación positiva entre desigualdad y no uso de Internet.  
+- La correlación *between* refleja diferencias estructurales entre países, mientras que la *within* muestra la relación dentro de cada país a lo largo del tiempo.  
+
+
+## Evolución Temporal
+
+El gráfico siguiente resume la evolución global anual del coeficiente de Gini (línea sólida) y el no uso de Internet (línea discontinua). Se identificaron valores de no usuarios de Internet que superan el 100% de la población, lo cual responde a inconsistencias en las fuentes de datos. No obstante, estas anomalías no alteran la tendencia general observada en el análisis.
+
+```{r}
+panel_plot <- panel_use |>
+  mutate(decade = paste0(floor(year/10)*10, "s"))
+
+ggplot(panel_plot, aes(x = gini, y = nonnet_norm)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Relación entre desigualdad (Gini) y no uso de Internet (normalizado)",
+    x = "Coeficiente de Gini",
+    y = "No uso de Internet sobre población",
+    caption = "Puntos: observaciones país-año; línea: ajuste lineal global."
+  ) +
+  theme_minimal(base_size = 11)
+
+```
+
+```{r}
+trend <- panel_use |>
+  group_by(year) |>
+  summarise(
+    gini_mean = mean(gini, na.rm = TRUE),
+    nonnet_mean = mean(nonnet_norm, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(trend, aes(x = year)) +
+  geom_line(aes(y = gini_mean), linewidth = 0.8) +
+  geom_line(aes(y = nonnet_mean*100), linetype = "dashed", linewidth = 0.8) +
+  labs(title = "Promedios globales por año",
+       x = "Año",
+       y = "Gini (línea sólida) | No uso (%) (línea discontinua)",
+       caption = "No uso normalizado multiplicado por 100 para escala comparable en el gráfico.") +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+# Discusión
+
+- Los resultados confirman que la **brecha digital está asociada con la desigualdad estructural**: países con mayores niveles de desigualdad mantienen mayor proporción de no usuarios de Internet.  
+- A pesar de la expansión global de Internet, persisten diferencias marcadas entre países y regiones.  
+- El análisis *within* sugiere que, incluso en países donde la conectividad aumentó, la desigualdad sigue modulando el ritmo de adopción.  
+
+---
+
+# Conclusiones
+
+- Existe una correlación robusta y positiva entre desigualdad y exclusión digital.  
+- La reducción del no uso de Internet no necesariamente implica una disminución de la desigualdad: ambas dimensiones avanzan con dinámicas parcialmente independientes.  
+- Para comprender mejor el fenómeno, es recomendable complementar con variables adicionales (PIB per cápita, educación, urbanización).  
+- Este análisis aporta un **enfoque reproducible** para explorar la interacción entre desigualdad socioeconómica y transformación digital en perspectiva histórica.  
+
+---
+
+# Referencias
+
+- World Bank Data (coeficiente de Gini).  
+- Gapminder, Internet usage datasets.  
+- Población: United Nations, World Population Prospects.  
